@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 25
     env:
-      SSH_KEY_PATH: /home/runner/.ssh/notes_ci_deploy   # <— absolute path on GH runner
+      SSH_KEY_PATH: /home/runner/.ssh/notes_ci_deploy
 
     steps:
       - name: Precheck environment secrets
@@ -29,22 +29,54 @@ jobs:
           [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "❌ VM_SSH_KEY missing"; exit 1)
           echo "✅ Secrets present."
 
-      - name: Write SSH private key (notes_ci_deploy)
+      - name: Write SSH private key and validate
         shell: bash
         run: |
+          set -euo pipefail
           mkdir -p "$(dirname "$SSH_KEY_PATH")"
           umask 077
-          # Write the *private* key exactly as stored (multi-line OK)
-          printf '%s' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH"
+
+          # Write as-is first
+          printf '%s' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH" || { echo "❌ Couldn't write key"; exit 1; }
           chmod 600 "$SSH_KEY_PATH"
+
+          # Quick sanity checks
+          # If the file looks like a PUBLIC key (single line: ssh-rsa/ssh-ed25519 ...), fail early.
+          if grep -qE '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp)' "$SSH_KEY_PATH"; then
+            echo "❌ VM_SSH_KEY contains a PUBLIC key. Put the PRIVATE key here (BEGIN OPENSSH/RSA PRIVATE KEY)."
+            exit 1
+          fi
+
+          # Try to parse the private key (no output; just validation)
+          if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
+            echo "ℹ️ Key not parseable as-is. If you stored it base64, decoding fallback will be attempted..."
+            # Try base64 decode fallback
+            tmpd="$(mktemp -d)"
+            if echo "${{ secrets.VM_SSH_KEY }}" | base64 -d > "$tmpd/decoded" 2>/dev/null; then
+              mv "$tmpd/decoded" "$SSH_KEY_PATH"
+              chmod 600 "$SSH_KEY_PATH"
+              if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
+                echo "❌ VM_SSH_KEY is not a valid OpenSSH/RSA private key, or it is passphrase-protected."
+                echo "   If your key has a passphrase, add VM_SSH_PASSPHRASE and set it below."
+                exit 1
+              fi
+              echo "✅ Decoded base64 key successfully."
+            else
+              echo "❌ VM_SSH_KEY is not a parseable private key (and not base64)."
+              echo "   Ensure it begins with '-----BEGIN OPENSSH PRIVATE KEY-----' or '-----BEGIN RSA PRIVATE KEY-----'."
+              exit 1
+            fi
+          else
+            echo "✅ Private key format looks good."
+          fi
 
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
-          key_path: ${{ env.SSH_KEY_PATH }}            # <— use the absolute path
-          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}  # uncomment if your key has one
+          key_path: ${{ env.SSH_KEY_PATH }}
+          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}   # uncomment if your key is passphrase-protected
           script_stop: true
           port: 22
           script: |
@@ -64,7 +96,7 @@ jobs:
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) pull/refresh repo
+            # 2) repo
             if [ ! -d .git ]; then
               git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
