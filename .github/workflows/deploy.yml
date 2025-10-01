@@ -16,10 +16,9 @@ jobs:
       - name: Precheck environment secrets
         shell: bash
         run: |
-          : "${{ secrets.VM_HOST?VM_HOST missing in environment 'azure' }}"
-          : "${{ secrets.VM_USER?VM_USER missing in environment 'azure' }}"
-          : "${{ secrets.VM_SSH_KEY?VM_SSH_KEY missing in environment 'azure' }}"
-
+          [ -n "${{ secrets.VM_HOST }}" ] || (echo "VM_HOST missing in environment"; exit 1)
+          [ -n "${{ secrets.VM_USER }}" ] || (echo "VM_USER missing in environment"; exit 1)
+          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "VM_SSH_KEY missing in environment"; exit 1)
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
