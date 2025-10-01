@@ -38,13 +38,7 @@ jobs:
           umask 077
           echo "${{ secrets.VM_SSH_KEY_B64 }}" | base64 -d > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
-
-          # Validate private key (no passphrase expected)
-          if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
-            echo "❌ Decoded key is not a valid OpenSSH private key (or needs a passphrase)."
-            echo "   Recreate the key without a passphrase and re-create VM_SSH_KEY_B64 from the file."
-            exit 1
-          fi
+          ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1 || { echo "❌ Invalid private key"; exit 1; }
           echo "✅ Private key decoded & valid."
 
       - name: Show CI key fingerprint (safe)
@@ -57,32 +51,7 @@ jobs:
           mkdir -p /home/runner/.ssh
           ssh-keyscan -H "${{ secrets.VM_HOST }}" >> /home/runner/.ssh/known_hosts 2>/dev/null || true
 
-      - name: Probe Docker / Compose (non-fatal)
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key_path: ${{ env.SSH_KEY_PATH }}
-          port: 22
-          script_stop: true
-          debug: true
-          script: |
-            set -Eeuo pipefail
-            echo "== whoami / uname =="
-            whoami || true
-            uname -a || true
-
-            echo "== docker client =="
-            command -v docker && docker --version || echo "docker client: not found"
-
-            echo "== compose detection =="
-            (docker compose version && echo "compose plugin OK") || true
-            (docker-compose --version && echo "legacy docker-compose OK") || true
-
-            echo "== daemon status =="
-            (sudo systemctl is-active docker && echo "docker active") || (echo "docker not active"; true)
-
-      - name: SSH to VM and deploy (debug)
+      - name: SSH to VM and deploy (debug, drone-safe)
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
@@ -96,54 +65,31 @@ jobs:
             set -x
 
             # Ensure git
-            if ! command -v git >/dev/null 2>&1; then
-              sudo apt-get update -y && sudo apt-get install -y git
-            fi
+            if ! command -v git >/dev/null 2>&1; then sudo apt-get update -y && sudo apt-get install -y git; fi
 
-            # Start docker if installed but inactive (ignore if systemd absent)
+            # Start docker if present (ignore if not systemd)
             sudo systemctl start docker 2>/dev/null || true
 
-            # Choose compose command (plugin or legacy), always with sudo
-            if sudo docker compose version >/dev/null 2>&1; then
-              COMPOSE_CMD="sudo docker compose"
-              echo "Using: docker compose"
-            elif command -v docker-compose >/dev/null 2>&1; then
-              COMPOSE_CMD="sudo docker-compose"
-              echo "Using: docker-compose (legacy)"
-            else
-              echo "❌ Neither 'docker compose' nor 'docker-compose' is available."; exit 1
-            fi
+            # Choose compose command (single-line conditionals: drone-safe)
+            if sudo docker compose version >/dev/null 2>&1; then COMPOSE_CMD="sudo docker compose"; echo "Using: docker compose"; else if command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="sudo docker-compose"; echo "Using: docker-compose (legacy)"; else echo "❌ No compose found"; exit 1; fi; fi
 
-            # On error: dump diagnostics & logs
-            trap 'echo "---- DIAGNOSTICS (on error) ----";
-                  $COMPOSE_CMD ps || true;
-                  $COMPOSE_CMD logs --no-color --tail=200 || true;
-                  sudo docker ps -a || true;
-                  sudo docker system df || true;
-                  command -v lsof >/dev/null 2>&1 && sudo lsof -nP -i :3001 || true;
-                  echo "---- END DIAGNOSTICS ----"' ERR
+            # On error: dump diagnostics
+            trap 'echo "---- DIAGNOSTICS ----"; $COMPOSE_CMD ps || true; $COMPOSE_CMD logs --no-color --tail=200 || true; sudo docker ps -a || true; sudo docker system df || true; command -v lsof >/dev/null 2>&1 && sudo lsof -nP -i :3001 || true; echo "---- END DIAGNOSTICS ----"' ERR
 
-            # 1) App folder & ownership
+            # 1) App folder
             sudo mkdir -p /opt/notes-app
             U="$(id -un)"; G="$(id -gn)"
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) Repo (clone/refresh)
-            if [ ! -d .git ]; then
-              git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
-            else
-              git fetch origin main --prune
-              git reset --hard origin/main
-            fi
+            # 2) Repo (single line if/else so wrapper won't bail)
+            if [ -d .git ]; then git fetch origin main --prune && git reset --hard origin/main; else git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .; fi
 
-            # 3) Find compose file (root or backend/)
-            COMPOSE_DIR="."
-            [ -f docker-compose.yml ] || { [ -f backend/docker-compose.yml ] && COMPOSE_DIR="backend"; }
-            [ -f "$COMPOSE_DIR/docker-compose.yml" ] || { echo "❌ docker-compose.yml not found"; exit 1; }
+            # 3) Find compose file (single line if/elif/else)
+            if [ -f docker-compose.yml ]; then COMPOSE_DIR="."; elif [ -f backend/docker-compose.yml ]; then COMPOSE_DIR="backend"; else echo "❌ docker-compose.yml not found"; exit 1; fi
             cd "$COMPOSE_DIR"
 
-            # 4) Override: Frontend API URL points to VM
+            # 4) Create override (API URL)
             API_URL="http://${{ secrets.VM_HOST }}:3001"
             cat > docker-compose.vm.yml <<EOF
             services:
@@ -153,7 +99,7 @@ jobs:
                     REACT_APP_API_URL: ${API_URL}
             EOF
 
-            # 5) Validate merged config (shows errors early)
+            # 5) Validate config (merges files; shows errors early)
             $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml config
 
             # 6) Build (plain logs) and Up
