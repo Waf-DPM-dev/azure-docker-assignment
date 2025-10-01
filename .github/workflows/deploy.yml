@@ -1,4 +1,4 @@
-name: Deploy to Azure VM (smoke)
+name: Deploy to Azure VM
 
 on:
   push:
@@ -6,25 +6,57 @@ on:
 
 jobs:
   deploy:
+    # uses your Environment so env-scoped secrets are available
     environment:
-      name: azure               # ⬅️ must match your environment’s exact name
-      url: http://${{ secrets.VM_HOST }}   # optional nice link on the run page
+      name: azure
+      url: http://${{ secrets.VM_HOST }}
     runs-on: ubuntu-latest
+    timeout-minutes: 25
 
     steps:
       - name: Precheck environment secrets
         run: |
-          [ -n "${{ secrets.VM_HOST }}" ] || (echo "VM_HOST missing"; exit 1)
-          [ -n "${{ secrets.VM_USER }}" ] || (echo "VM_USER missing"; exit 1)
-          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "VM_SSH_KEY missing"; exit 1)
+          [ -n "${{ secrets.VM_HOST }}" ] || (echo "VM_HOST missing in environment"; exit 1)
+          [ -n "${{ secrets.VM_USER }}" ] || (echo "VM_USER missing in environment"; exit 1)
+          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "VM_SSH_KEY missing in environment"; exit 1)
 
-      - name: SSH smoke test
+      - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            whoami
-            hostname
-            echo SSH_OK
+            set -euo pipefail
+
+            # 1) Ensure app folder exists and is owned by the login user
+            sudo mkdir -p /opt/notes-app
+            sudo chown "$USER":"$USER" /opt/notes-app
+            cd /opt/notes-app
+
+            # 2) Get or update the repo
+            if [ ! -d .git ]; then
+              git clone https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
+            else
+              git fetch --all
+              git reset --hard origin/main
+            fi
+
+            # 3) Build & run with compose (frontend + backend + db)
+            cd backend
+
+            # Override so the built React app calls the VM API URL
+            cat > docker-compose.vm.yml <<EOF
+            services:
+              frontend:
+                build:
+                  context: ../frontend
+                  args:
+                    REACT_APP_API_URL: http://${{ secrets.VM_HOST }}:3001
+            EOF
+
+            docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
+
+            # 4) Basic status/health
+            docker compose ps
+            curl -sS http://localhost:3001/health || true
