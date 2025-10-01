@@ -3,6 +3,7 @@ name: Deploy to Azure VM
 on:
   push:
     branches: [ main ]
+  workflow_dispatch: {}   # run manually from the Actions tab
 
 permissions:
   contents: read
@@ -26,37 +27,31 @@ jobs:
           set -euo pipefail
           [ -n "${{ secrets.VM_HOST }}" ] || (echo "❌ VM_HOST missing"; exit 1)
           [ -n "${{ secrets.VM_USER }}" ] || (echo "❌ VM_USER missing"; exit 1)
-          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "❌ VM_SSH_KEY missing"; exit 1)
+          [ -n "${{ secrets.VM_SSH_KEY_B64 }}" ] || (echo "❌ VM_SSH_KEY_B64 missing"; exit 1)
           echo "✅ Secrets present."
 
-      - name: Write SSH private key and validate
+      - name: Write SSH private key from base64 and validate
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p "$(dirname "$SSH_KEY_PATH")"
           umask 077
-          printf '%s' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH"
+          echo "${{ secrets.VM_SSH_KEY_B64 }}" | base64 -d > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
 
-          # If a PUBLIC key was pasted by mistake, fail fast.
-          if grep -qE '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp)' "$SSH_KEY_PATH"; then
-            echo "❌ VM_SSH_KEY contains a PUBLIC key. Paste the PRIVATE key (BEGIN ... PRIVATE KEY)."
-            exit 1
-          fi
-
-          # Validate private key format
+          # Validate the key parses as a private key
           if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
-            echo "❌ VM_SSH_KEY is not a valid OpenSSH/RSA private key (or needs a passphrase)."
-            echo "   Use gh CLI to set from file, or add VM_SSH_PASSPHRASE if your key is protected."
+            echo "❌ Decoded key is not a valid OpenSSH private key (or needs a passphrase)."
+            echo "   Recreate the key with NO passphrase and re-create VM_SSH_KEY_B64 from the file."
             exit 1
           fi
-          echo "✅ Private key format looks good."
+          echo "✅ Private key decoded & valid."
 
       - name: Show CI key fingerprint (safe)
         shell: bash
         run: ssh-keygen -l -f "$SSH_KEY_PATH"
 
-      - name: Add host key to known_hosts (optional)
+      - name: Add host key to known_hosts (optional hardening)
         shell: bash
         run: |
           mkdir -p /home/runner/.ssh
@@ -68,24 +63,27 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key_path: ${{ env.SSH_KEY_PATH }}
-          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}  # only if you set one
-          script_stop: true
           port: 22
+          script_stop: true
           script: |
             set -Eeuo pipefail
 
+            # Ensure required tools on the VM
             if ! command -v git >/dev/null 2>&1; then
               sudo apt-get update -y && sudo apt-get install -y git
             fi
             if ! docker compose version >/dev/null 2>&1; then
-              echo "❌ Docker Compose plugin not found on VM"; exit 1
+              echo "❌ Docker Compose plugin not found (docker compose). Install Docker Engine + compose-plugin on the VM."
+              exit 1
             fi
 
+            # 1) App folder
             sudo mkdir -p /opt/notes-app
             U="$(id -un)"; G="$(id -gn)"
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
+            # 2) Repo (clone or refresh)
             if [ ! -d .git ]; then
               git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
@@ -93,11 +91,15 @@ jobs:
               git reset --hard origin/main
             fi
 
+            # 3) Locate docker-compose.yml (root or backend/)
             COMPOSE_DIR="."
-            [ -f docker-compose.yml ] || { [ -f backend/docker-compose.yml ] && COMPOSE_DIR="backend"; }
+            if [ ! -f docker-compose.yml ] && [ -f backend/docker-compose.yml ]; then
+              COMPOSE_DIR="backend"
+            fi
             [ -f "$COMPOSE_DIR/docker-compose.yml" ] || { echo "❌ docker-compose.yml not found"; exit 1; }
             cd "$COMPOSE_DIR"
 
+            # 3a) Frontend build override: point React app to VM API
             cat > docker-compose.vm.yml <<'EOF'
             services:
               frontend:
@@ -107,7 +109,10 @@ jobs:
             EOF
             sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" docker-compose.vm.yml
 
+            # 3b) Build & run
             docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
+
+            # 4) Health & status
             docker compose ps
             curl -fsS http://localhost:3001/health || true
 
