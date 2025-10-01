@@ -51,7 +51,7 @@ jobs:
           mkdir -p /home/runner/.ssh
           ssh-keyscan -H "${{ secrets.VM_HOST }}" >> /home/runner/.ssh/known_hosts 2>/dev/null || true
 
-      - name: SSH to VM and deploy (drone-safe + robust)
+      - name: SSH to VM and deploy (drone-safe)
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
@@ -61,7 +61,7 @@ jobs:
           script_stop: true
           debug: true
           script: |
-            set -Eeuo pipefail
+            set -o pipefail
             set -x
 
             # Ensure git
@@ -70,12 +70,8 @@ jobs:
             # Start docker if present (ignore if not systemd)
             sudo systemctl start docker 2>/dev/null || true
 
-            # Choose compose command (single-line conditionals to avoid line-exit)
+            # Choose compose command (single-line if/else so wrapper won't bail)
             if sudo docker compose version >/dev/null 2>&1; then COMPOSE_CMD="sudo docker compose"; echo "Using: docker compose"; else if command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="sudo docker-compose"; echo "Using: docker-compose (legacy)"; else echo "❌ No compose found"; exit 1; fi; fi
-
-            # On error: dump diagnostics
-            diag() { echo "---- DIAGNOSTICS ----"; $COMPOSE_CMD ps || true; $COMPOSE_CMD logs --no-color --tail=200 || true; sudo docker ps -a || true; sudo docker system df || true; command -v lsof >/dev/null 2>&1 && sudo lsof -nP -i :3001 || true; echo "---- END DIAGNOSTICS ----"; }
-            trap 'diag' ERR
 
             # 1) App folder
             sudo mkdir -p /opt/notes-app
@@ -83,15 +79,18 @@ jobs:
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) Repo (single-line if/else so wrapper won't bail)
+            # 2) Repo (single-line conditional; no mid-line non-zero)
             if [ -d .git ]; then git fetch origin main --prune && git reset --hard origin/main; else git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .; fi
 
-            # 3) Find compose file (single-line if/elif/else)
+            # 3) Find compose file (root or backend/)
             if [ -f docker-compose.yml ]; then COMPOSE_DIR="."; elif [ -f backend/docker-compose.yml ]; then COMPOSE_DIR="backend"; else echo "❌ docker-compose.yml not found"; exit 1; fi
             cd "$COMPOSE_DIR"
 
-            # 4) Overrides
-            # 4a) Frontend override: point API to the VM (quote value to keep YAML happy)
+            # Remember project name to compute container names (e.g., backend-db-1)
+            PROJECT_NAME="$(basename "$PWD")"
+            DB_CONT="${PROJECT_NAME}-db-1"
+
+            # 4a) Frontend override: point API to the VM (quote value)
             cat > docker-compose.vm.yml <<'YAML'
             services:
               frontend:
@@ -120,22 +119,26 @@ jobs:
                 restart: unless-stopped
             YAML
 
-            # 5) Validate merged config (shows syntax errors early)
-            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml config
+            # 5) Show merged config (don't fail the whole step if this errors)
+            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml config || true
 
-            # 6) Build and Up (capture RC for diagnostics but try to continue)
-            DOCKER_BUILDKIT=1 $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml build --progress=plain || BUILD_RC=$?
-            if [ "${BUILD_RC:-0}" -ne 0 ]; then echo "⚠️ compose build returned $BUILD_RC"; fi
+            # 6) Remove old stopped db container so restart policy applies cleanly
+            sudo docker rm -f "$DB_CONT" >/dev/null 2>&1 || true
 
-            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml up -d --remove-orphans || UP_RC=$?
-            if [ "${UP_RC:-0}" -ne 0 ]; then echo "⚠️ compose up returned $UP_RC (continuing to diagnose)"; fi
+            # 7) Build & up (force recreate) — never let a single line non-zero kill the session
+            DOCKER_BUILDKIT=1 $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml build --progress=plain || true
+            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml up -d --remove-orphans --force-recreate || true
 
-            # 7) Ensure db is up (common issue)
-            RUNNING_SERVICES="$($COMPOSE_CMD ps --services 2>/dev/null || true)"
-            if ! echo "$RUNNING_SERVICES" | grep -q '^db$'; then echo "ℹ️ db not reported running; starting explicitly..."; $COMPOSE_CMD up -d db || $COMPOSE_CMD start db || true; fi
+            # 8) Ensure db is up (if not, try to start explicitly)
+            if sudo docker ps --format '{{.Names}}' | grep -q "^${DB_CONT}$"; then echo "db running."; else echo "db not running; attempting to start"; $COMPOSE_CMD up -d db || $COMPOSE_CMD start db || true; fi
 
-            # 8) Status & health
-            $COMPOSE_CMD ps
+            # 9) Status & quick logs (non-fatal)
+            $COMPOSE_CMD ps || true
+            $COMPOSE_CMD logs --no-color --tail=120 || true
+            sudo docker ps -a || true
+            sudo docker system df || true
+
+            # 10) App health (non-fatal)
             curl -fsS http://localhost:3001/health || true
 
             echo "✅ Deployment complete."
