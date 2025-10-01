@@ -3,6 +3,7 @@ name: Deploy to Azure VM
 on: { push: { branches: ["main"] } }
 jobs:
   deploy:
+    environment: lab 
     runs-on: ubuntu-latest
     steps:
       - name: SSH to VM and deploy
