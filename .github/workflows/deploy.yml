@@ -1,34 +1,30 @@
-# .github/workflows/deploy.yml
-name: Deploy to Azure VM
-on: { push: { branches: ["main"] } }
+name: Deploy to Azure VM (smoke)
+
+on:
+  push:
+    branches: [ "main" ]
+
 jobs:
   deploy:
-    environment: lab
+    environment:
+      name: azure               # ⬅️ must match your environment’s exact name
+      url: http://${{ secrets.VM_HOST }}   # optional nice link on the run page
     runs-on: ubuntu-latest
+
     steps:
-      - name: SSH to VM and deploy
+      - name: Precheck environment secrets
+        run: |
+          [ -n "${{ secrets.VM_HOST }}" ] || (echo "VM_HOST missing"; exit 1)
+          [ -n "${{ secrets.VM_USER }}" ] || (echo "VM_USER missing"; exit 1)
+          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "VM_SSH_KEY missing"; exit 1)
+
+      - name: SSH smoke test
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
           script: |
-            set -e
-            sudo mkdir -p /opt/notes-app && sudo chown $USER:$USER /opt/notes-app
-            cd /opt/notes-app
-            if [ ! -d .git ]; then
-              git clone https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
-            else
-              git pull --rebase
-            fi
-            cd backend
-            cat > docker-compose.vm.yml <<'EOF'
-            services:
-              frontend:
-                build:
-                  context: ../frontend
-                  args:
-                    REACT_APP_API_URL: http://${{ secrets.VM_HOST }}:3001
-            EOF
-            docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
-            docker compose ps
+            whoami
+            hostname
+            echo SSH_OK
