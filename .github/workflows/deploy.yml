@@ -38,13 +38,13 @@ jobs:
           printf '%s' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
 
-          # If it's clearly a PUBLIC key, fail early.
+          # Fail fast if a PUBLIC key was pasted
           if grep -qE '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp)' "$SSH_KEY_PATH"; then
             echo "❌ VM_SSH_KEY contains a PUBLIC key. Paste the PRIVATE key (BEGIN ... PRIVATE KEY)."
             exit 1
           fi
 
-          # Validate key format; if base64-encoded, try to decode once.
+          # Validate (and try base64 fallback once)
           if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
             echo "ℹ️ Trying base64 decode fallback..."
             tmpd="$(mktemp -d)"
@@ -69,8 +69,7 @@ jobs:
         shell: bash
         run: ssh-keygen -l -f "$SSH_KEY_PATH"
 
-      # Optional: pin host key (safe). Not strictly required for appleboy/ssh-action.
-      - name: Add host key to known_hosts
+      - name: Add host key to known_hosts (optional)
         shell: bash
         run: |
           mkdir -p /home/runner/.ssh
@@ -82,7 +81,7 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key_path: ${{ env.SSH_KEY_PATH }}
-          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}   # <-- uncomment if your key has one
+          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}   # only if your key has one
           script_stop: true
           port: 22
           script: |
@@ -102,7 +101,7 @@ jobs:
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) pull/refresh repo
+            # 2) repo
             if [ ! -d .git ]; then
               git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
