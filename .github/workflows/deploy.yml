@@ -38,10 +38,9 @@ jobs:
           umask 077
           echo "${{ secrets.VM_SSH_KEY_B64 }}" | base64 -d > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
-          if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
-            echo "❌ Decoded key is not a valid OpenSSH private key (or needs a passphrase)."
-            exit 1
-          fi
+          # Validate as private key (no passphrase expected)
+          ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1 || {
+            echo "❌ Decoded key is not a valid OpenSSH private key."; exit 1; }
           echo "✅ Private key decoded & valid."
 
       - name: Show CI key fingerprint (safe)
@@ -54,8 +53,8 @@ jobs:
           mkdir -p /home/runner/.ssh
           ssh-keyscan -H "${{ secrets.VM_HOST }}" >> /home/runner/.ssh/known_hosts 2>/dev/null || true
 
-      # --- 1) Quick connectivity probe (keeps logs simple) ---
-      - name: Probe SSH connectivity & tools
+      # ---- Probe only; never fail this step ----
+      - name: Probe Docker / Compose (non-fatal)
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
@@ -66,61 +65,21 @@ jobs:
           debug: true
           script: |
             set -Eeuo pipefail
-            echo "== whoami / uname / docker versions =="
+            echo "== whoami / uname =="
             whoami || true
             uname -a || true
-            command -v git && git --version || echo "git: not found"
-            command -v docker && docker --version || echo "docker: not found"
-            (docker compose version && echo "compose OK") || echo "compose: not found"
 
-      # --- 2) Ensure Docker Engine + Compose v2 on the VM (idempotent) ---
-      - name: Install Docker & Compose if missing
-        uses: appleboy/ssh-action@v1.2.0
-        with:
-          host: ${{ secrets.VM_HOST }}
-          username: ${{ secrets.VM_USER }}
-          key_path: ${{ env.SSH_KEY_PATH }}
-          port: 22
-          script_stop: true
-          debug: true
-          script: |
-            set -Eeuo pipefail
+            echo "== docker client =="
+            command -v docker && docker --version || echo "docker client: not found"
 
-            need_docker=0
-            if ! command -v docker >/dev/null 2>&1; then
-              need_docker=1
-            fi
+            echo "== compose detection =="
+            (docker compose version && echo "compose plugin OK") || true
+            (docker-compose --version && echo "legacy docker-compose OK") || true
 
-            need_compose=0
-            if ! docker compose version >/dev/null 2>&1; then
-              need_compose=1
-            fi
+            echo "== daemon status =="
+            (sudo systemctl is-active docker && echo "docker active") || (echo "docker not active"; true)
 
-            if [ "$need_docker" -eq 1 ] || [ "$need_compose" -eq 1 ]; then
-              echo "🔧 Installing Docker Engine + compose-plugin..."
-              # Based on Docker's official apt repo steps (Ubuntu)
-              if ! [ -x /usr/bin/curl ]; then sudo apt-get update -y && sudo apt-get install -y curl ca-certificates; fi
-              sudo install -m 0755 -d /etc/apt/keyrings
-              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-              sudo chmod a+r /etc/apt/keyrings/docker.gpg
-              . /etc/os-release
-              echo \
-                "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
-                ${VERSION_CODENAME} stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
-              sudo apt-get update -y
-              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-
-              echo "✅ Docker installed."
-              sudo systemctl enable --now docker || true
-            else
-              echo "✅ Docker & Compose already present."
-            fi
-
-            # We will use sudo for docker to avoid group/login issues
-            sudo docker version
-            sudo docker compose version
-
-      # --- 3) Deploy ---
+      # ---- Deploy with robust docker/compose detection ----
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -133,9 +92,27 @@ jobs:
           script: |
             set -Eeuo pipefail
 
-            # Ensure git exists
+            # Ensure git
             if ! command -v git >/dev/null 2>&1; then
               sudo apt-get update -y && sudo apt-get install -y git
+            fi
+
+            # Start docker if present but not running (do not fail if systemctl not present)
+            if command -v docker >/dev/null 2>&1; then
+              sudo systemctl start docker 2>/dev/null || true
+            else
+              echo "❌ Docker client not found on VM."; exit 1
+            fi
+
+            # Choose compose command (plugin or legacy), always with sudo
+            if sudo docker compose version >/dev/null 2>&1; then
+              COMPOSE_CMD="sudo docker compose"
+              echo "Using: docker compose"
+            elif command -v docker-compose >/dev/null 2>&1; then
+              COMPOSE_CMD="sudo docker-compose"
+              echo "Using: docker-compose (legacy)"
+            else
+              echo "❌ Neither 'docker compose' nor 'docker-compose' is available."; exit 1
             fi
 
             # 1) App folder
@@ -158,7 +135,7 @@ jobs:
             [ -f "$COMPOSE_DIR/docker-compose.yml" ] || { echo "❌ docker-compose.yml not found"; exit 1; }
             cd "$COMPOSE_DIR"
 
-            # 3a) Override API URL for frontend build
+            # 4) Frontend API URL override
             cat > docker-compose.vm.yml <<'EOF'
             services:
               frontend:
@@ -168,11 +145,11 @@ jobs:
             EOF
             sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" docker-compose.vm.yml
 
-            # 3b) Build & run (use sudo docker to avoid group issues)
-            sudo docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
+            # 5) Build & run (works with either compose variant)
+            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml up -d --build
 
-            # 4) Health
-            sudo docker compose ps
+            # 6) Health & ps
+            $COMPOSE_CMD ps
             curl -fsS http://localhost:3001/health || true
 
             echo "✅ Deployment complete."
