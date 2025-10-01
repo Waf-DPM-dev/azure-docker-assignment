@@ -3,7 +3,7 @@ name: Deploy to Azure VM
 on:
   push:
     branches: [ main ]
-  workflow_dispatch: {}   # run manually from the Actions tab
+  workflow_dispatch: {}
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
   deploy:
     environment: azure
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    timeout-minutes: 30
     env:
       SSH_KEY_PATH: /home/runner/.ssh/notes_ci_deploy
 
@@ -38,10 +38,8 @@ jobs:
           umask 077
           echo "${{ secrets.VM_SSH_KEY_B64 }}" | base64 -d > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
-
           if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
             echo "❌ Decoded key is not a valid OpenSSH private key (or needs a passphrase)."
-            echo "   Recreate the key with NO passphrase and re-create VM_SSH_KEY_B64 from the file."
             exit 1
           fi
           echo "✅ Private key decoded & valid."
@@ -50,12 +48,79 @@ jobs:
         shell: bash
         run: ssh-keygen -l -f "$SSH_KEY_PATH"
 
-      - name: Add host key to known_hosts (optional hardening)
+      - name: Add host key to known_hosts (optional)
         shell: bash
         run: |
           mkdir -p /home/runner/.ssh
           ssh-keyscan -H "${{ secrets.VM_HOST }}" >> /home/runner/.ssh/known_hosts 2>/dev/null || true
 
+      # --- 1) Quick connectivity probe (keeps logs simple) ---
+      - name: Probe SSH connectivity & tools
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key_path: ${{ env.SSH_KEY_PATH }}
+          port: 22
+          script_stop: true
+          debug: true
+          script: |
+            set -Eeuo pipefail
+            echo "== whoami / uname / docker versions =="
+            whoami || true
+            uname -a || true
+            command -v git && git --version || echo "git: not found"
+            command -v docker && docker --version || echo "docker: not found"
+            (docker compose version && echo "compose OK") || echo "compose: not found"
+
+      # --- 2) Ensure Docker Engine + Compose v2 on the VM (idempotent) ---
+      - name: Install Docker & Compose if missing
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key_path: ${{ env.SSH_KEY_PATH }}
+          port: 22
+          script_stop: true
+          debug: true
+          script: |
+            set -Eeuo pipefail
+
+            need_docker=0
+            if ! command -v docker >/dev/null 2>&1; then
+              need_docker=1
+            fi
+
+            need_compose=0
+            if ! docker compose version >/dev/null 2>&1; then
+              need_compose=1
+            fi
+
+            if [ "$need_docker" -eq 1 ] || [ "$need_compose" -eq 1 ]; then
+              echo "🔧 Installing Docker Engine + compose-plugin..."
+              # Based on Docker's official apt repo steps (Ubuntu)
+              if ! [ -x /usr/bin/curl ]; then sudo apt-get update -y && sudo apt-get install -y curl ca-certificates; fi
+              sudo install -m 0755 -d /etc/apt/keyrings
+              curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+              sudo chmod a+r /etc/apt/keyrings/docker.gpg
+              . /etc/os-release
+              echo \
+                "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+                ${VERSION_CODENAME} stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+              sudo apt-get update -y
+              sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+              echo "✅ Docker installed."
+              sudo systemctl enable --now docker || true
+            else
+              echo "✅ Docker & Compose already present."
+            fi
+
+            # We will use sudo for docker to avoid group/login issues
+            sudo docker version
+            sudo docker compose version
+
+      # --- 3) Deploy ---
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -64,16 +129,13 @@ jobs:
           key_path: ${{ env.SSH_KEY_PATH }}
           port: 22
           script_stop: true
+          debug: true
           script: |
             set -Eeuo pipefail
 
-            # Ensure required tools on the VM
+            # Ensure git exists
             if ! command -v git >/dev/null 2>&1; then
               sudo apt-get update -y && sudo apt-get install -y git
-            fi
-            if ! docker compose version >/dev/null 2>&1; then
-              echo "❌ Docker Compose plugin not found (docker compose). Install Docker Engine + compose-plugin on the VM."
-              exit 1
             fi
 
             # 1) App folder
@@ -82,7 +144,7 @@ jobs:
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) Repo (clone or refresh)
+            # 2) Repo
             if [ ! -d .git ]; then
               git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
@@ -90,15 +152,13 @@ jobs:
               git reset --hard origin/main
             fi
 
-            # 3) Locate docker-compose.yml (root or backend/)
+            # 3) Compose location
             COMPOSE_DIR="."
-            if [ ! -f docker-compose.yml ] && [ -f backend/docker-compose.yml ]; then
-              COMPOSE_DIR="backend"
-            fi
+            [ -f docker-compose.yml ] || { [ -f backend/docker-compose.yml ] && COMPOSE_DIR="backend"; }
             [ -f "$COMPOSE_DIR/docker-compose.yml" ] || { echo "❌ docker-compose.yml not found"; exit 1; }
             cd "$COMPOSE_DIR"
 
-            # 3a) Frontend build override: point React app to VM API
+            # 3a) Override API URL for frontend build
             cat > docker-compose.vm.yml <<'EOF'
             services:
               frontend:
@@ -108,11 +168,11 @@ jobs:
             EOF
             sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" docker-compose.vm.yml
 
-            # 3b) Build & run
-            docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
+            # 3b) Build & run (use sudo docker to avoid group issues)
+            sudo docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
 
-            # 4) Health & status
-            docker compose ps
+            # 4) Health
+            sudo docker compose ps
             curl -fsS http://localhost:3001/health || true
 
             echo "✅ Deployment complete."
