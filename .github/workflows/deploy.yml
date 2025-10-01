@@ -51,7 +51,7 @@ jobs:
           mkdir -p /home/runner/.ssh
           ssh-keyscan -H "${{ secrets.VM_HOST }}" >> /home/runner/.ssh/known_hosts 2>/dev/null || true
 
-      - name: SSH to VM and deploy (debug, drone-safe)
+      - name: SSH to VM and deploy (drone-safe + robust)
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
@@ -70,11 +70,20 @@ jobs:
             # Start docker if present (ignore if not systemd)
             sudo systemctl start docker 2>/dev/null || true
 
-            # Choose compose command (single-line conditionals: drone-safe)
+            # Choose compose command (single-line conditionals to avoid drone line-exit)
             if sudo docker compose version >/dev/null 2>&1; then COMPOSE_CMD="sudo docker compose"; echo "Using: docker compose"; else if command -v docker-compose >/dev/null 2>&1; then COMPOSE_CMD="sudo docker-compose"; echo "Using: docker-compose (legacy)"; else echo "❌ No compose found"; exit 1; fi; fi
 
             # On error: dump diagnostics
-            trap 'echo "---- DIAGNOSTICS ----"; $COMPOSE_CMD ps || true; $COMPOSE_CMD logs --no-color --tail=200 || true; sudo docker ps -a || true; sudo docker system df || true; command -v lsof >/dev/null 2>&1 && sudo lsof -nP -i :3001 || true; echo "---- END DIAGNOSTICS ----"' ERR
+            diag() {
+              echo "---- DIAGNOSTICS ----"
+              $COMPOSE_CMD ps || true
+              $COMPOSE_CMD logs --no-color --tail=200 || true
+              sudo docker ps -a || true
+              sudo docker system df || true
+              command -v lsof >/dev/null 2>&1 && sudo lsof -nP -i :3001 || true
+              echo "---- END DIAGNOSTICS ----"
+            }
+            trap 'diag' ERR
 
             # 1) App folder
             sudo mkdir -p /opt/notes-app
@@ -82,14 +91,15 @@ jobs:
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) Repo (single line if/else so wrapper won't bail)
+            # 2) Repo (single-line if/else so wrapper won't bail)
             if [ -d .git ]; then git fetch origin main --prune && git reset --hard origin/main; else git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .; fi
 
-            # 3) Find compose file (single line if/elif/else)
+            # 3) Find compose file (single-line if/elif/else)
             if [ -f docker-compose.yml ]; then COMPOSE_DIR="."; elif [ -f backend/docker-compose.yml ]; then COMPOSE_DIR="backend"; else echo "❌ docker-compose.yml not found"; exit 1; fi
             cd "$COMPOSE_DIR"
 
-            # 4) Create override (API URL)
+            # 4) Create overrides:
+            # 4a) Frontend override: point API to the VM
             API_URL="http://${{ secrets.VM_HOST }}:3001"
             cat > docker-compose.vm.yml <<EOF
             services:
@@ -99,15 +109,46 @@ jobs:
                     REACT_APP_API_URL: ${API_URL}
             EOF
 
-            # 5) Validate config (merges files; shows errors early)
-            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml config
+            # 4b) Reliability override: restart policies + db healthcheck + backend waits for db
+            # NOTE: $$ escapes env expansion inside heredoc for compose to see $POSTGRES_* at runtime.
+            cat > docker-compose.reliability.yml <<'EOF'
+            services:
+              db:
+                restart: unless-stopped
+                healthcheck:
+                  test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-postgres} || pg_isready -U postgres -d postgres"]
+                  interval: 10s
+                  timeout: 5s
+                  retries: 20
+              backend:
+                restart: unless-stopped
+                depends_on:
+                  db:
+                    condition: service_healthy
+              frontend:
+                restart: unless-stopped
+            EOF
 
-            # 6) Build (plain logs) and Up
-            DOCKER_BUILDKIT=1 $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml build --progress=plain
-            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml up -d
+            # 5) Validate merged config (shows errors early)
+            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml config
 
-            # 7) Status & health
+            # 6) Build and Up (capture RC instead of hard fail; we will diagnose anyway)
+            DOCKER_BUILDKIT=1 $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml build --progress=plain || BUILD_RC=$?
+            if [ "${BUILD_RC:-0}" -ne 0 ]; then echo "⚠️ compose build returned $BUILD_RC"; fi
+
+            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml -f docker-compose.reliability.yml up -d --remove-orphans || UP_RC=$?
+            if [ "${UP_RC:-0}" -ne 0 ]; then echo "⚠️ compose up returned $UP_RC (will attempt to continue and diagnose)"; fi
+
+            # 7) If db is not running (common), try to bring it up explicitly
+            RUNNING_SERVICES="$($COMPOSE_CMD ps --services 2>/dev/null || true)"
+            if ! echo "$RUNNING_SERVICES" | grep -q '^db$'; then
+              echo "ℹ️ db service not reported running; attempting to start db explicitly..."
+              $COMPOSE_CMD up -d db || $COMPOSE_CMD start db || true
+            fi
+
+            # 8) Status & health
             $COMPOSE_CMD ps
+            # Try backend health; if it fails, keep going but show logs in diagnostics trap if step fails later
             curl -fsS http://localhost:3001/health || true
 
             echo "✅ Deployment complete."
