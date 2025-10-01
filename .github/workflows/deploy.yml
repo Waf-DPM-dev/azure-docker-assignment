@@ -16,6 +16,8 @@ jobs:
     environment: azure
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    env:
+      SSH_KEY_PATH: /home/runner/.ssh/notes_ci_deploy   # <— absolute path on GH runner
 
     steps:
       - name: Precheck environment secrets
@@ -27,25 +29,22 @@ jobs:
           [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "❌ VM_SSH_KEY missing"; exit 1)
           echo "✅ Secrets present."
 
-      - name: Write SSH private key
+      - name: Write SSH private key (notes_ci_deploy)
         shell: bash
         run: |
-          mkdir -p ~/.ssh
+          mkdir -p "$(dirname "$SSH_KEY_PATH")"
           umask 077
-          # Write the *private* key exactly as stored (multi-line supported)
-          printf '%s' "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ci
-          chmod 600 ~/.ssh/id_ci
-          # Optional hardening (requires host key known in advance):
-          # ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
+          # Write the *private* key exactly as stored (multi-line OK)
+          printf '%s' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH"
+          chmod 600 "$SSH_KEY_PATH"
 
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
-          key_path: ~/.ssh/id_ci
-          # If your key has a passphrase, also create VM_SSH_PASSPHRASE and uncomment:
-          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}
+          key_path: ${{ env.SSH_KEY_PATH }}            # <— use the absolute path
+          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}  # uncomment if your key has one
           script_stop: true
           port: 22
           script: |
