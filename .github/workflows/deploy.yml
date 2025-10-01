@@ -5,57 +5,99 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-azure-vm
+  cancel-in-progress: true
+
 jobs:
   deploy:
-    # Use the Environment named "azure" so its environment-scoped secrets are available
     environment: azure
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
     steps:
+      # Optional: quick sanity check that environment-level secrets exist
       - name: Precheck environment secrets
         shell: bash
         run: |
-          [ -n "${{ secrets.VM_HOST }}" ] || (echo "VM_HOST missing in environment"; exit 1)
-          [ -n "${{ secrets.VM_USER }}" ] || (echo "VM_USER missing in environment"; exit 1)
-          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "VM_SSH_KEY missing in environment"; exit 1)
+          set -euo pipefail
+          [ -n "${{ secrets.VM_HOST }}" ] || (echo "❌ VM_HOST missing in environment" && exit 1)
+          [ -n "${{ secrets.VM_USER }}" ] || (echo "❌ VM_USER missing in environment" && exit 1)
+          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "❌ VM_SSH_KEY missing in environment" && exit 1)
+          echo "✅ Secrets are present."
+
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key: ${{ secrets.VM_SSH_KEY }}
+          port: 22
+          script_stop: true
           script: |
-            set -euo pipefail
+            set -Eeuo pipefail
 
-            # 1) Ensure app folder exists and is owned by the login user
+            # Ensure required tools exist (no-op if already installed)
+            if ! command -v git >/dev/null 2>&1; then
+              sudo apt-get update -y
+              sudo apt-get install -y git
+            fi
+            if ! docker compose version >/dev/null 2>&1; then
+              echo "❌ Docker Compose plugin not found (docker compose). Please install it on the VM."
+              exit 1
+            fi
+
+            # 1) Ensure app folder exists and is owned by the logged-in user
             sudo mkdir -p /opt/notes-app
-            sudo chown "$USER":"$USER" /opt/notes-app
+            # In non-interactive shells $USER can be blank; use id -un/-gn for safety
+            U="$(id -un)"; G="$(id -gn)"
+            sudo chown "$U":"$G" /opt/notes-app
             cd /opt/notes-app
 
             # 2) Get or update the repo
             if [ ! -d .git ]; then
-              git clone https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
+              git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
-              git fetch --all
+              git fetch origin main --prune
               git reset --hard origin/main
             fi
 
-            # 3) Build & run with compose (frontend + backend + db)
-            cd backend
+            # 3) Find the docker-compose.yml (support root or backend/ layouts)
+            COMPOSE_DIR="."
+            if [ ! -f docker-compose.yml ]; then
+              if [ -f backend/docker-compose.yml ]; then
+                COMPOSE_DIR="backend"
+              else
+                echo "❌ docker-compose.yml not found at repo root or ./backend"
+                ls -la
+                exit 1
+              fi
+            fi
+            cd "$COMPOSE_DIR"
 
-            # Override so the built React app calls the VM API URL
-            cat > docker-compose.vm.yml <<EOF
+            # 3a) Create a small override to inject the VM API URL into the frontend build
+            # Use a placeholder first, then swap to avoid leaking secrets during heredoc expansion
+            OVERRIDE_FILE="docker-compose.vm.yml"
+            cat > "$OVERRIDE_FILE" <<'EOF'
             services:
               frontend:
                 build:
-                  context: ../frontend
                   args:
-                    REACT_APP_API_URL: http://${{ secrets.VM_HOST }}:3001
+                    REACT_APP_API_URL: __API_URL__
             EOF
 
-            docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
+            # Replace placeholder with actual URL (safe, single-line substitution)
+            sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" "$OVERRIDE_FILE"
+
+            # 3b) Build & run (detached)
+            docker compose -f docker-compose.yml -f "$OVERRIDE_FILE" up -d --build
 
             # 4) Basic status/health
             docker compose ps
-            curl -sS http://localhost:3001/health || true
+            # Backend health (ignore failure so the workflow can still surface ps output)
+            curl -fsS http://localhost:3001/health || true
+
+            echo "✅ Deployment complete."
