@@ -39,7 +39,6 @@ jobs:
           echo "${{ secrets.VM_SSH_KEY_B64 }}" | base64 -d > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
 
-          # Validate the key parses as a private key
           if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
             echo "❌ Decoded key is not a valid OpenSSH private key (or needs a passphrase)."
             echo "   Recreate the key with NO passphrase and re-create VM_SSH_KEY_B64 from the file."
