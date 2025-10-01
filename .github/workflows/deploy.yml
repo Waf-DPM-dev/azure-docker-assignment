@@ -20,7 +20,7 @@ jobs:
       SSH_KEY_PATH: /home/runner/.ssh/notes_ci_deploy
 
     steps:
-      - name: Precheck environment secrets
+      - name: Precheck env secrets
         shell: bash
         run: |
           set -euo pipefail
@@ -38,32 +38,19 @@ jobs:
           printf '%s' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
 
-          # Fail fast if a PUBLIC key was pasted
+          # If a PUBLIC key was pasted by mistake, fail fast.
           if grep -qE '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp)' "$SSH_KEY_PATH"; then
             echo "❌ VM_SSH_KEY contains a PUBLIC key. Paste the PRIVATE key (BEGIN ... PRIVATE KEY)."
             exit 1
           fi
 
-          # Validate (and try base64 fallback once)
+          # Validate private key format
           if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
-            echo "ℹ️ Trying base64 decode fallback..."
-            tmpd="$(mktemp -d)"
-            if echo "${{ secrets.VM_SSH_KEY }}" | base64 -d > "$tmpd/decoded" 2>/dev/null; then
-              mv "$tmpd/decoded" "$SSH_KEY_PATH"
-              chmod 600 "$SSH_KEY_PATH"
-              if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
-                echo "❌ VM_SSH_KEY is not a valid OpenSSH/RSA private key, or it is passphrase-protected."
-                echo "   If your key has a passphrase, add VM_SSH_PASSPHRASE."
-                exit 1
-              fi
-              echo "✅ Decoded base64 key successfully."
-            else
-              echo "❌ VM_SSH_KEY is not parseable as a private key."
-              exit 1
-            fi
-          else
-            echo "✅ Private key format looks good."
+            echo "❌ VM_SSH_KEY is not a valid OpenSSH/RSA private key (or needs a passphrase)."
+            echo "   Use gh CLI to set from file, or add VM_SSH_PASSPHRASE if your key is protected."
+            exit 1
           fi
+          echo "✅ Private key format looks good."
 
       - name: Show CI key fingerprint (safe)
         shell: bash
@@ -81,13 +68,12 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key_path: ${{ env.SSH_KEY_PATH }}
-          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}   # only if your key has one
+          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}  # only if you set one
           script_stop: true
           port: 22
           script: |
             set -Eeuo pipefail
 
-            # Ensure tools
             if ! command -v git >/dev/null 2>&1; then
               sudo apt-get update -y && sudo apt-get install -y git
             fi
@@ -95,13 +81,11 @@ jobs:
               echo "❌ Docker Compose plugin not found on VM"; exit 1
             fi
 
-            # 1) app folder
             sudo mkdir -p /opt/notes-app
             U="$(id -un)"; G="$(id -gn)"
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) repo
             if [ ! -d .git ]; then
               git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
@@ -109,13 +93,11 @@ jobs:
               git reset --hard origin/main
             fi
 
-            # 3) locate compose (root or backend/)
             COMPOSE_DIR="."
             [ -f docker-compose.yml ] || { [ -f backend/docker-compose.yml ] && COMPOSE_DIR="backend"; }
             [ -f "$COMPOSE_DIR/docker-compose.yml" ] || { echo "❌ docker-compose.yml not found"; exit 1; }
             cd "$COMPOSE_DIR"
 
-            # 3a) override for frontend build API URL
             cat > docker-compose.vm.yml <<'EOF'
             services:
               frontend:
@@ -125,10 +107,7 @@ jobs:
             EOF
             sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" docker-compose.vm.yml
 
-            # 3b) build & run
             docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
-
-            # 4) quick health
             docker compose ps
             curl -fsS http://localhost:3001/health || true
 
