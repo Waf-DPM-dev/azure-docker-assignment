@@ -1,12 +1,10 @@
 name: Deploy to Azure VM
-
 on:
   push:
     branches: [ "main" ]
 
 jobs:
   deploy:
-    # uses your Environment so env-scoped secrets are available
     environment:
       name: azure
       url: http://${{ secrets.VM_HOST }}
