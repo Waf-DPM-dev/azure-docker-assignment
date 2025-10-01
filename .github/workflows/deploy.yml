@@ -1,0 +1,33 @@
+# .github/workflows/deploy.yml
+name: Deploy to Azure VM
+on: { push: { branches: ["main"] } }
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: SSH to VM and deploy
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.VM_HOST }}
+          username: ${{ secrets.VM_USER }}
+          key: ${{ secrets.VM_SSH_KEY }}
+          script: |
+            set -e
+            sudo mkdir -p /opt/notes-app && sudo chown $USER:$USER /opt/notes-app
+            cd /opt/notes-app
+            if [ ! -d .git ]; then
+              git clone https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
+            else
+              git pull --rebase
+            fi
+            cd backend
+            cat > docker-compose.vm.yml <<'EOF'
+            services:
+              frontend:
+                build:
+                  context: ../frontend
+                  args:
+                    REACT_APP_API_URL: http://${{ secrets.VM_HOST }}:3001
+            EOF
+            docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
+            docker compose ps
