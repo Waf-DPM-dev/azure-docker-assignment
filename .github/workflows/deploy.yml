@@ -38,9 +38,13 @@ jobs:
           umask 077
           echo "${{ secrets.VM_SSH_KEY_B64 }}" | base64 -d > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
-          # Validate as private key (no passphrase expected)
-          ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1 || {
-            echo "❌ Decoded key is not a valid OpenSSH private key."; exit 1; }
+
+          # Validate private key (no passphrase expected)
+          if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
+            echo "❌ Decoded key is not a valid OpenSSH private key (or needs a passphrase)."
+            echo "   Recreate the key without a passphrase and re-create VM_SSH_KEY_B64 from the file."
+            exit 1
+          fi
           echo "✅ Private key decoded & valid."
 
       - name: Show CI key fingerprint (safe)
@@ -53,7 +57,6 @@ jobs:
           mkdir -p /home/runner/.ssh
           ssh-keyscan -H "${{ secrets.VM_HOST }}" >> /home/runner/.ssh/known_hosts 2>/dev/null || true
 
-      # ---- Probe only; never fail this step ----
       - name: Probe Docker / Compose (non-fatal)
         uses: appleboy/ssh-action@v1.2.0
         with:
@@ -79,8 +82,7 @@ jobs:
             echo "== daemon status =="
             (sudo systemctl is-active docker && echo "docker active") || (echo "docker not active"; true)
 
-      # ---- Deploy with robust docker/compose detection ----
-      - name: SSH to VM and deploy
+      - name: SSH to VM and deploy (debug)
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
@@ -91,18 +93,15 @@ jobs:
           debug: true
           script: |
             set -Eeuo pipefail
+            set -x
 
             # Ensure git
             if ! command -v git >/dev/null 2>&1; then
               sudo apt-get update -y && sudo apt-get install -y git
             fi
 
-            # Start docker if present but not running (do not fail if systemctl not present)
-            if command -v docker >/dev/null 2>&1; then
-              sudo systemctl start docker 2>/dev/null || true
-            else
-              echo "❌ Docker client not found on VM."; exit 1
-            fi
+            # Start docker if installed but inactive (ignore if systemd absent)
+            sudo systemctl start docker 2>/dev/null || true
 
             # Choose compose command (plugin or legacy), always with sudo
             if sudo docker compose version >/dev/null 2>&1; then
@@ -115,13 +114,22 @@ jobs:
               echo "❌ Neither 'docker compose' nor 'docker-compose' is available."; exit 1
             fi
 
-            # 1) App folder
+            # On error: dump diagnostics & logs
+            trap 'echo "---- DIAGNOSTICS (on error) ----";
+                  $COMPOSE_CMD ps || true;
+                  $COMPOSE_CMD logs --no-color --tail=200 || true;
+                  sudo docker ps -a || true;
+                  sudo docker system df || true;
+                  command -v lsof >/dev/null 2>&1 && sudo lsof -nP -i :3001 || true;
+                  echo "---- END DIAGNOSTICS ----"' ERR
+
+            # 1) App folder & ownership
             sudo mkdir -p /opt/notes-app
             U="$(id -un)"; G="$(id -gn)"
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) Repo
+            # 2) Repo (clone/refresh)
             if [ ! -d .git ]; then
               git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
@@ -129,26 +137,30 @@ jobs:
               git reset --hard origin/main
             fi
 
-            # 3) Compose location
+            # 3) Find compose file (root or backend/)
             COMPOSE_DIR="."
             [ -f docker-compose.yml ] || { [ -f backend/docker-compose.yml ] && COMPOSE_DIR="backend"; }
             [ -f "$COMPOSE_DIR/docker-compose.yml" ] || { echo "❌ docker-compose.yml not found"; exit 1; }
             cd "$COMPOSE_DIR"
 
-            # 4) Frontend API URL override
-            cat > docker-compose.vm.yml <<'EOF'
+            # 4) Override: Frontend API URL points to VM
+            API_URL="http://${{ secrets.VM_HOST }}:3001"
+            cat > docker-compose.vm.yml <<EOF
             services:
               frontend:
                 build:
                   args:
-                    REACT_APP_API_URL: __API_URL__
+                    REACT_APP_API_URL: ${API_URL}
             EOF
-            sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" docker-compose.vm.yml
 
-            # 5) Build & run (works with either compose variant)
-            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml up -d --build
+            # 5) Validate merged config (shows errors early)
+            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml config
 
-            # 6) Health & ps
+            # 6) Build (plain logs) and Up
+            DOCKER_BUILDKIT=1 $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml build --progress=plain
+            $COMPOSE_CMD -f docker-compose.yml -f docker-compose.vm.yml up -d
+
+            # 7) Status & health
             $COMPOSE_CMD ps
             curl -fsS http://localhost:3001/health || true
 
