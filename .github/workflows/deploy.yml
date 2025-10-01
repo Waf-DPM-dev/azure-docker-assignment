@@ -1,22 +1,24 @@
 name: Deploy to Azure VM
+
 on:
   push:
-    branches: [ "main" ]
+    branches:
+      - main
 
 jobs:
   deploy:
-    environment:
-      name: azure
-      url: http://${{ secrets.VM_HOST }}
+    # Use the Environment named "azure" so its environment-scoped secrets are available
+    environment: azure
     runs-on: ubuntu-latest
     timeout-minutes: 25
 
     steps:
       - name: Precheck environment secrets
+        shell: bash
         run: |
-          [ -n "${{ secrets.VM_HOST }}" ] || (echo "VM_HOST missing in environment"; exit 1)
-          [ -n "${{ secrets.VM_USER }}" ] || (echo "VM_USER missing in environment"; exit 1)
-          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "VM_SSH_KEY missing in environment"; exit 1)
+          : "${{ secrets.VM_HOST?VM_HOST missing in environment 'azure' }}"
+          : "${{ secrets.VM_USER?VM_USER missing in environment 'azure' }}"
+          : "${{ secrets.VM_SSH_KEY?VM_SSH_KEY missing in environment 'azure' }}"
 
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
