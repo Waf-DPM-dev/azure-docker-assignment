@@ -35,40 +35,46 @@ jobs:
           set -euo pipefail
           mkdir -p "$(dirname "$SSH_KEY_PATH")"
           umask 077
-
-          # Write as-is first
-          printf '%s' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH" || { echo "❌ Couldn't write key"; exit 1; }
+          printf '%s' "${{ secrets.VM_SSH_KEY }}" > "$SSH_KEY_PATH"
           chmod 600 "$SSH_KEY_PATH"
 
-          # Quick sanity checks
-          # If the file looks like a PUBLIC key (single line: ssh-rsa/ssh-ed25519 ...), fail early.
+          # If it's clearly a PUBLIC key, fail early.
           if grep -qE '^(ssh-(rsa|ed25519)|ecdsa-sha2-nistp)' "$SSH_KEY_PATH"; then
-            echo "❌ VM_SSH_KEY contains a PUBLIC key. Put the PRIVATE key here (BEGIN OPENSSH/RSA PRIVATE KEY)."
+            echo "❌ VM_SSH_KEY contains a PUBLIC key. Paste the PRIVATE key (BEGIN ... PRIVATE KEY)."
             exit 1
           fi
 
-          # Try to parse the private key (no output; just validation)
+          # Validate key format; if base64-encoded, try to decode once.
           if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
-            echo "ℹ️ Key not parseable as-is. If you stored it base64, decoding fallback will be attempted..."
-            # Try base64 decode fallback
+            echo "ℹ️ Trying base64 decode fallback..."
             tmpd="$(mktemp -d)"
             if echo "${{ secrets.VM_SSH_KEY }}" | base64 -d > "$tmpd/decoded" 2>/dev/null; then
               mv "$tmpd/decoded" "$SSH_KEY_PATH"
               chmod 600 "$SSH_KEY_PATH"
               if ! ssh-keygen -y -f "$SSH_KEY_PATH" >/dev/null 2>&1; then
                 echo "❌ VM_SSH_KEY is not a valid OpenSSH/RSA private key, or it is passphrase-protected."
-                echo "   If your key has a passphrase, add VM_SSH_PASSPHRASE and set it below."
+                echo "   If your key has a passphrase, add VM_SSH_PASSPHRASE."
                 exit 1
               fi
               echo "✅ Decoded base64 key successfully."
             else
-              echo "❌ VM_SSH_KEY is not a parseable private key (and not base64)."
-              echo "   Ensure it begins with '-----BEGIN OPENSSH PRIVATE KEY-----' or '-----BEGIN RSA PRIVATE KEY-----'."
+              echo "❌ VM_SSH_KEY is not parseable as a private key."
               exit 1
             fi
           else
             echo "✅ Private key format looks good."
           fi
+
+      - name: Show CI key fingerprint (safe)
+        shell: bash
+        run: ssh-keygen -l -f "$SSH_KEY_PATH"
+
+      # Optional: pin host key (safe). Not strictly required for appleboy/ssh-action.
+      - name: Add host key to known_hosts
+        shell: bash
+        run: |
+          mkdir -p /home/runner/.ssh
+          ssh-keyscan -H "${{ secrets.VM_HOST }}" >> /home/runner/.ssh/known_hosts 2>/dev/null || true
 
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
@@ -76,13 +82,13 @@ jobs:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
           key_path: ${{ env.SSH_KEY_PATH }}
-          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}   # uncomment if your key is passphrase-protected
+          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}   # <-- uncomment if your key has one
           script_stop: true
           port: 22
           script: |
             set -Eeuo pipefail
 
-            # Ensure tools (no-op if present)
+            # Ensure tools
             if ! command -v git >/dev/null 2>&1; then
               sudo apt-get update -y && sudo apt-get install -y git
             fi
@@ -96,7 +102,7 @@ jobs:
             sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) repo
+            # 2) pull/refresh repo
             if [ ! -d .git ]; then
               git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
@@ -104,7 +110,7 @@ jobs:
               git reset --hard origin/main
             fi
 
-            # 3) locate compose file (root or backend/)
+            # 3) locate compose (root or backend/)
             COMPOSE_DIR="."
             [ -f docker-compose.yml ] || { [ -f backend/docker-compose.yml ] && COMPOSE_DIR="backend"; }
             [ -f "$COMPOSE_DIR/docker-compose.yml" ] || { echo "❌ docker-compose.yml not found"; exit 1; }
