@@ -96,7 +96,7 @@ jobs:
               frontend:
                 build:
                   args:
-                    REACT_APP_API_URL: "__API_URL__"
+                    REACT_APP_API_URL: "http://4.219.11.94:3001"
             YAML
             sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" docker-compose.vm.yml
 
