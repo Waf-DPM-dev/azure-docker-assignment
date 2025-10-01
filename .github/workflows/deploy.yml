@@ -2,8 +2,7 @@ name: Deploy to Azure VM
 
 on:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 permissions:
   contents: read
@@ -19,45 +18,54 @@ jobs:
     timeout-minutes: 25
 
     steps:
-      # Optional: quick sanity check that environment-level secrets exist
       - name: Precheck environment secrets
         shell: bash
         run: |
           set -euo pipefail
-          [ -n "${{ secrets.VM_HOST }}" ] || (echo "❌ VM_HOST missing in environment" && exit 1)
-          [ -n "${{ secrets.VM_USER }}" ] || (echo "❌ VM_USER missing in environment" && exit 1)
-          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "❌ VM_SSH_KEY missing in environment" && exit 1)
-          echo "✅ Secrets are present."
+          [ -n "${{ secrets.VM_HOST }}" ] || (echo "❌ VM_HOST missing"; exit 1)
+          [ -n "${{ secrets.VM_USER }}" ] || (echo "❌ VM_USER missing"; exit 1)
+          [ -n "${{ secrets.VM_SSH_KEY }}" ] || (echo "❌ VM_SSH_KEY missing"; exit 1)
+          echo "✅ Secrets present."
+
+      - name: Write SSH private key
+        shell: bash
+        run: |
+          mkdir -p ~/.ssh
+          umask 077
+          # Write the *private* key exactly as stored (multi-line supported)
+          printf '%s' "${{ secrets.VM_SSH_KEY }}" > ~/.ssh/id_ci
+          chmod 600 ~/.ssh/id_ci
+          # Optional hardening (requires host key known in advance):
+          # ssh-keyscan -H "${{ secrets.VM_HOST }}" >> ~/.ssh/known_hosts
 
       - name: SSH to VM and deploy
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ secrets.VM_HOST }}
           username: ${{ secrets.VM_USER }}
-          key: ${{ secrets.VM_SSH_KEY }}
-          port: 22
+          key_path: ~/.ssh/id_ci
+          # If your key has a passphrase, also create VM_SSH_PASSPHRASE and uncomment:
+          # passphrase: ${{ secrets.VM_SSH_PASSPHRASE }}
           script_stop: true
+          port: 22
           script: |
             set -Eeuo pipefail
 
-            # Ensure required tools exist (no-op if already installed)
+            # Ensure tools (no-op if present)
             if ! command -v git >/dev/null 2>&1; then
-              sudo apt-get update -y
-              sudo apt-get install -y git
+              sudo apt-get update -y && sudo apt-get install -y git
             fi
             if ! docker compose version >/dev/null 2>&1; then
-              echo "❌ Docker Compose plugin not found (docker compose). Please install it on the VM."
-              exit 1
+              echo "❌ Docker Compose plugin not found on VM"; exit 1
             fi
 
-            # 1) Ensure app folder exists and is owned by the logged-in user
+            # 1) app folder
             sudo mkdir -p /opt/notes-app
-            # In non-interactive shells $USER can be blank; use id -un/-gn for safety
             U="$(id -un)"; G="$(id -gn)"
-            sudo chown "$U":"$G" /opt/notes-app
+            sudo chown "$U:$G" /opt/notes-app
             cd /opt/notes-app
 
-            # 2) Get or update the repo
+            # 2) pull/refresh repo
             if [ ! -d .git ]; then
               git clone --depth=1 https://github.com/Waf-DPM-dev/azure-docker-assignment.git .
             else
@@ -65,39 +73,27 @@ jobs:
               git reset --hard origin/main
             fi
 
-            # 3) Find the docker-compose.yml (support root or backend/ layouts)
+            # 3) locate compose file (root or backend/)
             COMPOSE_DIR="."
-            if [ ! -f docker-compose.yml ]; then
-              if [ -f backend/docker-compose.yml ]; then
-                COMPOSE_DIR="backend"
-              else
-                echo "❌ docker-compose.yml not found at repo root or ./backend"
-                ls -la
-                exit 1
-              fi
-            fi
+            [ -f docker-compose.yml ] || { [ -f backend/docker-compose.yml ] && COMPOSE_DIR="backend"; }
+            [ -f "$COMPOSE_DIR/docker-compose.yml" ] || { echo "❌ docker-compose.yml not found"; exit 1; }
             cd "$COMPOSE_DIR"
 
-            # 3a) Create a small override to inject the VM API URL into the frontend build
-            # Use a placeholder first, then swap to avoid leaking secrets during heredoc expansion
-            OVERRIDE_FILE="docker-compose.vm.yml"
-            cat > "$OVERRIDE_FILE" <<'EOF'
+            # 3a) override for frontend build API URL
+            cat > docker-compose.vm.yml <<'EOF'
             services:
               frontend:
                 build:
                   args:
                     REACT_APP_API_URL: __API_URL__
             EOF
+            sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" docker-compose.vm.yml
 
-            # Replace placeholder with actual URL (safe, single-line substitution)
-            sed -i "s#__API_URL__#http://${{ secrets.VM_HOST }}:3001#g" "$OVERRIDE_FILE"
+            # 3b) build & run
+            docker compose -f docker-compose.yml -f docker-compose.vm.yml up -d --build
 
-            # 3b) Build & run (detached)
-            docker compose -f docker-compose.yml -f "$OVERRIDE_FILE" up -d --build
-
-            # 4) Basic status/health
+            # 4) quick health
             docker compose ps
-            # Backend health (ignore failure so the workflow can still surface ps output)
             curl -fsS http://localhost:3001/health || true
 
             echo "✅ Deployment complete."
